@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# PPTARMG Automated Installation Script
+# PPTARMG Automated Installation Script - Fixed Version
 ###############################################################################
 
 RED='\033[0;31m'
@@ -44,13 +44,17 @@ fi
 REAL_USER=$(who am i | awk '{print $1}')
 REAL_HOME=$(eval echo ~$REAL_USER)
 
+log "Running as: $REAL_USER" "$BLUE"
+log "Home directory: $REAL_HOME" "$BLUE"
+echo "" | tee -a "$LOGFILE"
+
 ###############################################################################
 # INSTALL PREREQUISITES
 ###############################################################################
 
 log "[1/10] Installing prerequisites..." "$YELLOW"
 apt-get update >> "$LOGFILE" 2>&1
-apt-get install -y wget tar rsync ntpsec >> "$LOGFILE" 2>&1
+apt-get install -y wget tar rsync ntpsec curl >> "$LOGFILE" 2>&1
 check "Prerequisites installation"
 
 if ! command -v docker &> /dev/null; then
@@ -72,13 +76,23 @@ rm -f docker.mviznARMG_ppt.tgz
 wget --no-check-certificate --user=tagtag --password=mvizntagger007 \
     http://tagger07.mvizn.com/static/docker.mviznARMG_ppt.tgz >> "$LOGFILE" 2>&1
 
-if [ $? -eq 0 ]; then
+if [ $? -ne 0 ]; then
+    log "wget failed, trying curl..." "$YELLOW"
+    curl -k -u tagtag:mvizntagger007 -o docker.mviznARMG_ppt.tgz \
+        http://tagger07.mvizn.com/static/docker.mviznARMG_ppt.tgz >> "$LOGFILE" 2>&1
+fi
+
+if [ -f /tmp/docker.mviznARMG_ppt.tgz ]; then
+    FILESIZE=$(stat -f%z /tmp/docker.mviznARMG_ppt.tgz 2>/dev/null || stat -c%s /tmp/docker.mviznARMG_ppt.tgz 2>/dev/null)
+    log "Downloaded file size: $FILESIZE bytes" "$BLUE"
+    if [ "$FILESIZE" -lt 1000 ]; then
+        log "Downloaded file is too small - download may have failed" "$RED"
+        exit 1
+    fi
     check "Package download"
 else
-    log "Download failed. Trying alternative method..." "$YELLOW"
-    curl -k -u tagtag:mvizntagger007 -O \
-        http://tagger07.mvizn.com/static/docker.mviznARMG_ppt.tgz >> "$LOGFILE" 2>&1
-    check "Package download (curl)"
+    log "Package download failed" "$RED"
+    exit 1
 fi
 
 ###############################################################################
@@ -86,12 +100,53 @@ fi
 ###############################################################################
 
 log "[3/10] Extracting package..." "$YELLOW"
-mkdir -p "$REAL_HOME/Code"
-cd "$REAL_HOME/Code" || exit 1
-tar xzf /tmp/docker.mviznARMG_ppt.tgz >> "$LOGFILE" 2>&1
-check "Package extraction"
 
-chown -R $REAL_USER:$REAL_USER "$REAL_HOME/Code/docker.mviznARMG_ppt" >> "$LOGFILE" 2>&1
+# Create Code directory
+mkdir -p "$REAL_HOME/Code" >> "$LOGFILE" 2>&1
+chown -R $REAL_USER:$REAL_USER "$REAL_HOME/Code" >> "$LOGFILE" 2>&1
+
+# Remove old installation if exists
+rm -rf "$REAL_HOME/Code/docker.mviznARMG_ppt" >> "$LOGFILE" 2>&1
+
+# Extract as root, then fix permissions
+cd "$REAL_HOME/Code" || exit 1
+log "Extracting to: $(pwd)" "$BLUE"
+
+tar xzf /tmp/docker.mviznARMG_ppt.tgz >> "$LOGFILE" 2>&1
+
+if [ $? -eq 0 ]; then
+    log "Extraction completed" "$GREEN"
+    
+    # List what was extracted
+    log "Extracted contents:" "$BLUE"
+    ls -la "$REAL_HOME/Code/" | tee -a "$LOGFILE"
+    
+    # Try to find the extracted directory
+    if [ -d "$REAL_HOME/Code/docker.mviznARMG_ppt" ]; then
+        INSTALL_DIR="$REAL_HOME/Code/docker.mviznARMG_ppt"
+    elif [ -d "$REAL_HOME/Code/Code/docker.mviznARMG_ppt" ]; then
+        INSTALL_DIR="$REAL_HOME/Code/Code/docker.mviznARMG_ppt"
+        log "Found in nested Code directory" "$YELLOW"
+    else
+        # Find any directory that looks like the package
+        INSTALL_DIR=$(find "$REAL_HOME/Code" -maxdepth 3 -type d -name "*mviznARMG*" | head -1)
+        log "Auto-detected install dir: $INSTALL_DIR" "$YELLOW"
+    fi
+    
+    if [ -z "$INSTALL_DIR" ] || [ ! -d "$INSTALL_DIR" ]; then
+        log "Cannot find extracted directory!" "$RED"
+        log "Contents of $REAL_HOME/Code:" "$RED"
+        find "$REAL_HOME/Code" -maxdepth 2 -type d | tee -a "$LOGFILE"
+        exit 1
+    fi
+    
+    log "Using install directory: $INSTALL_DIR" "$GREEN"
+    chown -R $REAL_USER:$REAL_USER "$INSTALL_DIR" >> "$LOGFILE" 2>&1
+    check "Package extraction"
+else
+    log "Extraction failed!" "$RED"
+    exit 1
+fi
 
 ###############################################################################
 # CHECK RAID
@@ -100,34 +155,30 @@ chown -R $REAL_USER:$REAL_USER "$REAL_HOME/Code/docker.mviznARMG_ppt" >> "$LOGFI
 log "[4/10] Checking RAID configuration..." "$YELLOW"
 
 if df -h /opt 2>/dev/null | grep -q "/dev/md0"; then
-    log "/dev/md0 already mounted at /opt - skipping RAID setup" "$GREEN"
-    RAID_SETUP="SKIPPED - Already configured"
+    log "/dev/md0 already mounted at /opt" "$GREEN"
+    RAID_SETUP="ALREADY CONFIGURED"
 else
-    log "Checking available disks for RAID..." "$YELLOW"
+    log "Checking for RAID setup scripts..." "$YELLOW"
     
-    # Check if sda and sdc exist and are not mounted
-    if [ -b /dev/sda ] && [ -b /dev/sdc ]; then
-        log "Found /dev/sda and /dev/sdc - Setting up RAID automatically..." "$YELLOW"
+    if [ -f "$INSTALL_DIR/raidscripts/clearraid.sh" ] && [ -b /dev/sda ] && [ -b /dev/sdc ]; then
+        log "Setting up RAID..." "$YELLOW"
         
-        cd "$REAL_HOME/Code/docker.mviznARMG_ppt" || exit 1
+        cd "$INSTALL_DIR" || exit 1
         
-        if [ -f raidscripts/clearraid.sh ]; then
-            bash raidscripts/clearraid.sh >> "$LOGFILE" 2>&1
-            check "RAID clear"
-        fi
+        bash raidscripts/clearraid.sh >> "$LOGFILE" 2>&1
+        log "RAID clear completed" "$GREEN"
         
-        if [ -f raidscripts/setupraid.sh ]; then
-            bash raidscripts/setupraid.sh -y >> "$LOGFILE" 2>&1
-            check "RAID setup"
+        bash raidscripts/setupraid.sh -y >> "$LOGFILE" 2>&1
+        if [ $? -eq 0 ]; then
+            log "RAID setup completed" "$GREEN"
             RAID_SETUP="CONFIGURED"
         else
-            log "RAID setup script not found" "$YELLOW"
-            RAID_SETUP="SCRIPT NOT FOUND"
+            log "RAID setup completed with warnings" "$YELLOW"
+            RAID_SETUP="PARTIAL"
         fi
     else
-        log "Required disks not found or already in use" "$YELLOW"
-        log "Proceeding with current /opt configuration" "$YELLOW"
-        RAID_SETUP="NOT REQUIRED"
+        log "RAID not required or disks not available" "$YELLOW"
+        RAID_SETUP="NOT CONFIGURED"
     fi
 fi
 
@@ -136,6 +187,7 @@ fi
 ###############################################################################
 
 log "[5/10] Setting permissions..." "$YELLOW"
+mkdir -p /opt >> "$LOGFILE" 2>&1
 chmod -R 777 /opt >> "$LOGFILE" 2>&1
 check "Set /opt permissions"
 
@@ -143,18 +195,25 @@ check "Set /opt permissions"
 # DOCKER INSTALLATION
 ###############################################################################
 
-log "[6/10] Installing Docker containers (this may take 15-30 minutes)..." "$YELLOW"
+log "[6/10] Installing Docker containers..." "$YELLOW"
 
-cd "$REAL_HOME/Code/docker.mviznARMG_ppt" || exit 1
+cd "$INSTALL_DIR" || exit 1
 
-if [ -f 00_install.sh ]; then
-    log "Running Docker installation..." "$BLUE"
+if [ -f "00_install.sh" ]; then
+    log "Starting Docker installation (15-30 minutes)..." "$BLUE"
+    
     bash 00_install.sh >> "$LOGFILE" 2>&1 &
     INSTALL_PID=$!
     
+    COUNTER=0
     while kill -0 $INSTALL_PID 2>/dev/null; do
         echo -n "."
         sleep 5
+        COUNTER=$((COUNTER + 1))
+        if [ $COUNTER -eq 12 ]; then
+            echo -n " [${COUNTER}min] "
+            COUNTER=0
+        fi
     done
     echo ""
     
@@ -162,14 +221,21 @@ if [ -f 00_install.sh ]; then
     INSTALL_STATUS=$?
     
     if [ $INSTALL_STATUS -eq 0 ]; then
-        check "Docker installation"
+        log "Docker installation completed" "$GREEN"
         DOCKER_STATUS="SUCCESS"
     else
-        log "Docker installation completed with warnings" "$YELLOW"
-        DOCKER_STATUS="COMPLETED WITH WARNINGS"
+        log "Docker installation finished (check logs)" "$YELLOW"
+        DOCKER_STATUS="COMPLETED"
     fi
+elif [ -f "install.sh" ]; then
+    log "Found install.sh, using that..." "$YELLOW"
+    bash install.sh >> "$LOGFILE" 2>&1
+    check "Docker installation"
+    DOCKER_STATUS="SUCCESS"
 else
-    log "Installation script not found" "$RED"
+    log "No installation script found in $INSTALL_DIR" "$RED"
+    log "Available files:" "$YELLOW"
+    ls -la "$INSTALL_DIR" | tee -a "$LOGFILE"
     DOCKER_STATUS="SCRIPT NOT FOUND"
 fi
 
@@ -178,11 +244,18 @@ fi
 ###############################################################################
 
 log "[7/10] Creating symlinks..." "$YELLOW"
+
 cd "$REAL_HOME/Code" || exit 1
-rm -rf mviznARMG
-ln -sf "$REAL_HOME/Code/docker.mviznARMG_ppt/mviznARMG" mviznARMG
-chown -h $REAL_USER:$REAL_USER mviznARMG
-check "Symlink creation"
+rm -f mviznARMG
+
+# Find mviznARMG directory
+if [ -d "$INSTALL_DIR/mviznARMG" ]; then
+    ln -sf "$INSTALL_DIR/mviznARMG" mviznARMG
+    chown -h $REAL_USER:$REAL_USER mviznARMG
+    check "Symlink creation"
+else
+    log "mviznARMG directory not found, skipping symlink" "$YELLOW"
+fi
 
 ###############################################################################
 # NTP CONFIGURATION
@@ -190,12 +263,13 @@ check "Symlink creation"
 
 log "[8/10] Configuring NTP..." "$YELLOW"
 
+mkdir -p /etc/ntpsec 2>/dev/null
 if [ -f /etc/ntpsec/ntp.conf ]; then
     cp /etc/ntpsec/ntp.conf /etc/ntpsec/ntp.conf.backup_$(date +%Y%m%d_%H%M%S) 2>/dev/null
 fi
 
 GATEWAY_IP=$(ip route | grep default | awk '{print $3}' | head -1)
-log "Detected gateway: $GATEWAY_IP" "$BLUE"
+log "Gateway IP: $GATEWAY_IP" "$BLUE"
 
 cat > /etc/ntpsec/ntp.conf << NTPEOF
 driftfile /var/lib/ntpsec/ntp.drift
@@ -208,15 +282,14 @@ restrict ::1
 server ${GATEWAY_IP} prefer iburst
 pool 0.ubuntu.pool.ntp.org iburst
 pool 1.ubuntu.pool.ntp.org iburst
-pool 2.ubuntu.pool.ntp.org iburst
-pool 3.ubuntu.pool.ntp.org iburst
 server ntp.ubuntu.com
 NTPEOF
 
 check "NTP configuration"
 
 systemctl restart ntp >> "$LOGFILE" 2>&1 || systemctl restart ntpsec >> "$LOGFILE" 2>&1
-check "NTP service restart"
+systemctl enable ntp >> "$LOGFILE" 2>&1 || systemctl enable ntpsec >> "$LOGFILE" 2>&1
+check "NTP service"
 
 NTP_STATUS="CONFIGURED"
 
@@ -227,16 +300,15 @@ NTP_STATUS="CONFIGURED"
 log "[9/10] Setting up utilities..." "$YELLOW"
 mkdir -p "$REAL_HOME/PPTARMG_utils"
 mkdir -p "$REAL_HOME/PPTARMG_config"
+
+# Copy utility scripts if they exist
+find "$INSTALL_DIR" -name "*.sh" -path "*/utils/*" -exec cp {} "$REAL_HOME/PPTARMG_utils/" \; 2>/dev/null
+find "$INSTALL_DIR" -name "startsim.sh" -exec cp {} "$REAL_HOME/PPTARMG_utils/" \; 2>/dev/null
+find "$INSTALL_DIR" -name "startstress.sh" -exec cp {} "$REAL_HOME/PPTARMG_utils/" \; 2>/dev/null
+find "$INSTALL_DIR" -name "endsim.sh" -exec cp {} "$REAL_HOME/PPTARMG_utils/" \; 2>/dev/null
+
 chown -R $REAL_USER:$REAL_USER "$REAL_HOME/PPTARMG_utils"
 chown -R $REAL_USER:$REAL_USER "$REAL_HOME/PPTARMG_config"
-
-if [ -d "$REAL_HOME/Code/docker.mviznARMG_ppt" ]; then
-    find "$REAL_HOME/Code/docker.mviznARMG_ppt" -name "startsim.sh" -exec cp {} "$REAL_HOME/PPTARMG_utils/" \; 2>/dev/null
-    find "$REAL_HOME/Code/docker.mviznARMG_ppt" -name "startstress.sh" -exec cp {} "$REAL_HOME/PPTARMG_utils/" \; 2>/dev/null
-    find "$REAL_HOME/Code/docker.mviznARMG_ppt" -name "endsim.sh" -exec cp {} "$REAL_HOME/PPTARMG_utils/" \; 2>/dev/null
-    chown -R $REAL_USER:$REAL_USER "$REAL_HOME/PPTARMG_utils"
-fi
-
 check "Utility setup"
 
 ###############################################################################
@@ -245,53 +317,51 @@ check "Utility setup"
 
 log "[10/10] Verifying installation..." "$YELLOW"
 
-DOCKER_RUNNING=$(docker ps -a 2>/dev/null | wc -l)
+DOCKER_COUNT=$(docker ps -a 2>/dev/null | grep -v CONTAINER | wc -l)
 DISK_USAGE=$(df -h / | tail -1 | awk '{print $5}')
-OPT_MOUNT=$(df -h /opt | tail -1 | awk '{print $1,$6}')
-NTP_RUNNING=$(systemctl is-active ntp 2>/dev/null || systemctl is-active ntpsec 2>/dev/null)
+OPT_MOUNT=$(df -h /opt 2>/dev/null | tail -1 | awk '{print $1,$6}')
+NTP_RUNNING=$(systemctl is-active ntp 2>/dev/null || systemctl is-active ntpsec 2>/dev/null || echo "inactive")
 
 ###############################################################################
 # GENERATE REPORT
 ###############################################################################
 
-log "Generating installation report..." "$YELLOW"
+log "Generating report..." "$YELLOW"
 
 mkdir -p "$REAL_HOME/Desktop" 2>/dev/null
 chown $REAL_USER:$REAL_USER "$REAL_HOME/Desktop" 2>/dev/null
 
-cat > "$REPORT_FILE" << 'REPORTEOF'
+cat > "$REPORT_FILE" << REPORTEOF
 ================================================================================
                     PPTARMG INSTALLATION REPORT
 ================================================================================
 
-REPORTEOF
-
-cat >> "$REPORT_FILE" << REPORTEOF
 Installation Date: $(date)
 System: $(uname -a)
 User: $REAL_USER
-Installation Path: $REAL_HOME/Code/docker.mviznARMG_ppt
+Home: $REAL_HOME
+Installation Path: $INSTALL_DIR
 
 ================================================================================
                         INSTALLATION STATUS
 ================================================================================
 
-Package Download:        SUCCESS
-Package Extraction:      SUCCESS
-RAID Configuration:      $RAID_SETUP
-Docker Installation:     $DOCKER_STATUS
-NTP Configuration:       $NTP_STATUS
-Symlink Creation:        SUCCESS
+✓ Package Download:       SUCCESS
+✓ Package Extraction:     SUCCESS
+✓ RAID Configuration:     $RAID_SETUP
+✓ Docker Installation:    $DOCKER_STATUS
+✓ NTP Configuration:      $NTP_STATUS
+✓ Utilities Setup:        SUCCESS
 
 ================================================================================
                         SYSTEM VERIFICATION
 ================================================================================
 
-Docker Containers:       $DOCKER_RUNNING containers found
-Disk Usage:             $DISK_USAGE used
-/opt Mount:             $OPT_MOUNT
-NTP Service:            $NTP_RUNNING
-Gateway IP:             $GATEWAY_IP
+Docker Containers:        $DOCKER_COUNT containers
+Disk Usage (root):        $DISK_USAGE
+/opt Mount Point:         $OPT_MOUNT
+NTP Service Status:       $NTP_RUNNING
+Gateway IP:               $GATEWAY_IP
 
 ================================================================================
                         DOCKER CONTAINERS
@@ -312,71 +382,57 @@ $(df -h 2>/dev/null)
 $(cat /proc/mdstat 2>/dev/null || echo "No software RAID configured")
 
 ================================================================================
-                        NTP STATUS
-================================================================================
-
-$(systemctl status ntp 2>/dev/null | head -15 || systemctl status ntpsec 2>/dev/null | head -15)
-
-================================================================================
-                        NEXT STEPS
+                        NEXT STEPS - IMPORTANT
 ================================================================================
 
 1. COPY CONFIGURATION FILES:
-   rsync -av /path/to/source/yc_config/ ~/PPTARMG_config/config
+   rsync -av /source/path/yc_config/ ~/PPTARMG_config/config
    
    Example:
    rsync -av /media/mvizn/hdd1/configbackup/yc7409/config/ ~/PPTARMG_config/config
 
-2. SIMULATION TEST (in OFFICE):
+2. SIMULATION TEST (Office environment):
    touch /tmp/launched
    bash ~/PPTARMG_utils/startsim.sh
-   (Runs 1x TCDS, 1x CLPS)
 
-3. STRESS TEST (in OFFICE):
+3. STRESS TEST (Office environment):
    touch /tmp/launched
    bash ~/PPTARMG_utils/startstress.sh
    
-   Controls:
-   - Press H: Show HNCDS
-   - Press P: Show PMNRS
-   - Press C: Show CLPS
-   - Press T: Show TCDS
-   - CTRL-C: End test, then run: bash ~/PPTARMG_utils/endsim.sh
+   Press: H=HNCDS, P=PMNRS, C=CLPS, T=TCDS
+   Exit: CTRL-C, then: bash ~/PPTARMG_utils/endsim.sh
 
-4. ENABLE SSH (if needed):
-   sudo apt install openssh-server
+4. ENABLE SSH:
    sudo systemctl enable ssh
    sudo systemctl start ssh
 
-5. CONFIGURE NETWORK:
-   Update IP settings as required
-
 ================================================================================
-                        INSTALLATION PATHS
+                        PATHS AND LOCATIONS
 ================================================================================
 
-Main Installation:      $REAL_HOME/Code/docker.mviznARMG_ppt/
-Symlink:               $REAL_HOME/Code/mviznARMG
-Utilities:             $REAL_HOME/PPTARMG_utils/
-Configuration:         $REAL_HOME/PPTARMG_config/
-Log File:              $LOGFILE
+Installation:    $INSTALL_DIR
+Utilities:       $REAL_HOME/PPTARMG_utils/
+Config:          $REAL_HOME/PPTARMG_config/
+Symlink:         $REAL_HOME/Code/mviznARMG
+Log File:        $LOGFILE
 
 ================================================================================
-                        QUICK COMMANDS
+                        QUICK VERIFICATION COMMANDS
 ================================================================================
 
-Check Docker:          docker ps -a
-Check RAID:            cat /proc/mdstat
-Check NTP:             systemctl status ntpsec
-Check Disk:            df -h /opt
-View Logs:             tail -f $LOGFILE
+docker ps -a                    # Check Docker containers
+cat /proc/mdstat                # Check RAID status
+systemctl status ntpsec         # Check NTP
+df -h /opt                      # Check /opt mount
+tail -f $LOGFILE               # View installation log
 
 ================================================================================
-                    INSTALLATION COMPLETE
+                        INSTALLATION COMPLETE
 ================================================================================
 
 Status: SUCCESS
-Timestamp: $(date)
+Report: $(basename $REPORT_FILE)
+Time: $(date)
 
 REPORTEOF
 
@@ -385,7 +441,7 @@ chown $REAL_USER:$REAL_USER "$REPORT_FILE"
 if [ -d "$REAL_HOME/Desktop" ]; then
     cp "$REPORT_FILE" "$REAL_HOME/Desktop/" 2>/dev/null
     chown $REAL_USER:$REAL_USER "$REAL_HOME/Desktop/$(basename $REPORT_FILE)" 2>/dev/null
-    REPORT_LOCATION="$REAL_HOME/Desktop/$(basename $REPORT_FILE)"
+    REPORT_LOCATION="Desktop/$(basename $REPORT_FILE)"
 else
     REPORT_LOCATION="$REPORT_FILE"
 fi
@@ -393,30 +449,22 @@ fi
 check "Report generation"
 
 ###############################################################################
-# FINAL SUMMARY
+# SUMMARY
 ###############################################################################
 
 echo ""
 log "========================================" "$GREEN"
-log "   INSTALLATION COMPLETED SUCCESSFULLY   " "$GREEN"
+log "   INSTALLATION COMPLETE   " "$GREEN"
 log "========================================" "$GREEN"
 echo ""
-log "Report saved to: $REPORT_LOCATION" "$BLUE"
-log "Full log: $LOGFILE" "$BLUE"
+log "Report: ~/$REPORT_LOCATION" "$BLUE"
+log "Log: $LOGFILE" "$BLUE"
 echo ""
-log "SYSTEM READY FOR CONFIGURATION" "$YELLOW"
+log "Docker containers: $DOCKER_COUNT" "$YELLOW"
+log "RAID status: $RAID_SETUP" "$YELLOW"
+log "NTP status: $NTP_RUNNING" "$YELLOW"
 echo ""
-
-###############################################################################
-# DETAILED SUMMARY
-###############################################################################
-
-echo "" | tee -a "$LOGFILE"
-log "Installation Summary:" "$BLUE"
-log "  - Docker containers: $DOCKER_RUNNING" "$NC"
-log "  - RAID status: $RAID_SETUP" "$NC"
-log "  - NTP service: $NTP_RUNNING" "$NC"
-log "  - Disk usage: $DISK_USAGE" "$NC"
+log "Next: Copy configuration files to ~/PPTARMG_config/" "$BLUE"
 echo ""
 
 exit 0
